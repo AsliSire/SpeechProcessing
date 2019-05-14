@@ -1,0 +1,360 @@
+<html>
+<head>
+<title>data_generator.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #629755; font-style: italic;}
+.s1 { color: #a9b7c6;}
+.s2 { color: #cc7832;}
+.s3 { color: #6897bb;}
+.s4 { color: #6a8759;}
+.s5 { color: #808080;}
+</style>
+</head>
+<body bgcolor="#2b2b2b">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+data_generator.py</font>
+</center></td></tr></table>
+<pre><span class="s0">&quot;&quot;&quot; 
+Defines a class that is used to featurize audio clips, and provide 
+them to the network for training or testing. 
+&quot;&quot;&quot;</span>
+
+<span class="s2">import </span><span class="s1">json</span>
+<span class="s2">import </span><span class="s1">numpy </span><span class="s2">as </span><span class="s1">np</span>
+<span class="s2">import </span><span class="s1">random</span>
+<span class="s2">from </span><span class="s1">python_speech_features </span><span class="s2">import </span><span class="s1">mfcc</span>
+<span class="s2">import </span><span class="s1">librosa</span>
+<span class="s2">import </span><span class="s1">scipy.io.wavfile </span><span class="s2">as </span><span class="s1">wav</span>
+<span class="s2">import </span><span class="s1">matplotlib.pyplot </span><span class="s2">as </span><span class="s1">plt</span>
+<span class="s2">from </span><span class="s1">mpl_toolkits.axes_grid1 </span><span class="s2">import </span><span class="s1">make_axes_locatable</span>
+
+<span class="s2">from </span><span class="s1">utils </span><span class="s2">import </span><span class="s1">calc_feat_dim</span><span class="s2">, </span><span class="s1">spectrogram_from_file</span><span class="s2">, </span><span class="s1">text_to_int_sequence</span>
+<span class="s2">from </span><span class="s1">utils </span><span class="s2">import </span><span class="s1">conv_output_length</span>
+
+RNG_SEED = <span class="s3">123</span>
+
+<span class="s2">class </span><span class="s1">AudioGenerator():</span>
+    <span class="s2">def </span><span class="s1">__init__(self</span><span class="s2">, </span><span class="s1">step=</span><span class="s3">10</span><span class="s2">, </span><span class="s1">window=</span><span class="s3">20</span><span class="s2">, </span><span class="s1">max_freq=</span><span class="s3">8000</span><span class="s2">, </span><span class="s1">mfcc_dim=</span><span class="s3">13</span><span class="s2">,</span>
+        <span class="s1">minibatch_size=</span><span class="s3">20</span><span class="s2">, </span><span class="s1">desc_file=</span><span class="s2">None, </span><span class="s1">spectrogram=</span><span class="s2">True, </span><span class="s1">max_duration=</span><span class="s3">10.0</span><span class="s2">, </span>
+        <span class="s1">sort_by_duration=</span><span class="s2">False</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; 
+        Params: 
+            step (int): Step size in milliseconds between windows (for spectrogram ONLY) 
+            window (int): FFT window size in milliseconds (for spectrogram ONLY) 
+            max_freq (int): Only FFT bins corresponding to frequencies between 
+                [0, max_freq] are returned (for spectrogram ONLY) 
+            desc_file (str, optional): Path to a JSON-line file that contains 
+                labels and paths to the audio files. If this is None, then 
+                load metadata right away 
+        &quot;&quot;&quot;</span>
+
+        <span class="s1">self.feat_dim = calc_feat_dim(window</span><span class="s2">, </span><span class="s1">max_freq)</span>
+        self.mfcc_dim = mfcc_dim
+        self.feats_mean = np.zeros((self.feat_dim<span class="s2">,</span><span class="s1">))</span>
+        self.feats_std = np.ones((self.feat_dim<span class="s2">,</span><span class="s1">))</span>
+        self.rng = random.Random(RNG_SEED)
+        <span class="s2">if </span><span class="s1">desc_file </span><span class="s2">is not None</span><span class="s1">:</span>
+            self.load_metadata_from_desc_file(desc_file)
+        self.step = step
+        self.window = window
+        self.max_freq = max_freq
+        self.cur_train_index = <span class="s3">0</span>
+        <span class="s1">self.cur_valid_index = </span><span class="s3">0</span>
+        <span class="s1">self.cur_test_index = </span><span class="s3">0</span>
+        <span class="s1">self.max_duration=max_duration</span>
+        self.minibatch_size = minibatch_size
+        self.spectrogram = spectrogram
+        self.sort_by_duration = sort_by_duration
+
+    <span class="s2">def </span><span class="s1">get_batch(self</span><span class="s2">, </span><span class="s1">partition):</span>
+        <span class="s0">&quot;&quot;&quot; Obtain a batch of train, validation, or test data 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">partition == </span><span class="s4">'train'</span><span class="s1">:</span>
+            audio_paths = self.train_audio_paths
+            cur_index = self.cur_train_index
+            texts = self.train_texts
+        <span class="s2">elif </span><span class="s1">partition == </span><span class="s4">'valid'</span><span class="s1">:</span>
+            audio_paths = self.valid_audio_paths
+            cur_index = self.cur_valid_index
+            texts = self.valid_texts
+        <span class="s2">elif </span><span class="s1">partition == </span><span class="s4">'test'</span><span class="s1">:</span>
+            audio_paths = self.test_audio_paths
+            cur_index = self.test_valid_index
+            texts = self.test_texts
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">Exception(</span><span class="s4">&quot;Invalid partition. &quot;</span>
+                &quot;Must be train/validation&quot;<span class="s1">)</span>
+
+        features = [self.normalize(self.featurize(a)) <span class="s2">for </span><span class="s1">a </span><span class="s2">in </span>
+            <span class="s1">audio_paths[cur_index:cur_index+self.minibatch_size]]</span>
+
+        <span class="s5"># calculate necessary sizes</span>
+        <span class="s1">max_length = max([features[i].shape[</span><span class="s3">0</span><span class="s1">] </span>
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s3">0</span><span class="s2">, </span><span class="s1">self.minibatch_size)])</span>
+        max_string_length = max([len(texts[cur_index+i]) 
+            <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s3">0</span><span class="s2">, </span><span class="s1">self.minibatch_size)])</span>
+        
+        <span class="s5"># initialize the arrays</span>
+        <span class="s1">X_data = np.zeros([self.minibatch_size</span><span class="s2">, </span><span class="s1">max_length</span><span class="s2">, </span>
+            <span class="s1">self.feat_dim*self.spectrogram + self.mfcc_dim*(</span><span class="s2">not </span><span class="s1">self.spectrogram)])</span>
+        labels = np.ones([self.minibatch_size<span class="s2">, </span><span class="s1">max_string_length]) * </span><span class="s3">28</span>
+        <span class="s1">input_length = np.zeros([self.minibatch_size</span><span class="s2">, </span><span class="s3">1</span><span class="s1">])</span>
+        label_length = np.zeros([self.minibatch_size<span class="s2">, </span><span class="s3">1</span><span class="s1">])</span>
+        
+        <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">range(</span><span class="s3">0</span><span class="s2">, </span><span class="s1">self.minibatch_size):</span>
+            <span class="s5"># calculate X_data &amp; input_length</span>
+            <span class="s1">feat = features[i]</span>
+            input_length[i] = feat.shape[<span class="s3">0</span><span class="s1">]</span>
+            X_data[i<span class="s2">, </span><span class="s1">:feat.shape[</span><span class="s3">0</span><span class="s1">]</span><span class="s2">, </span><span class="s1">:] = feat</span>
+
+            <span class="s5"># calculate labels &amp; label_length</span>
+            <span class="s1">label = np.array(text_to_int_sequence(texts[cur_index+i])) </span>
+            labels[i<span class="s2">, </span><span class="s1">:len(label)] = label</span>
+            label_length[i] = len(label)
+ 
+        <span class="s5"># return the arrays</span>
+        <span class="s1">outputs = {</span><span class="s4">'ctc'</span><span class="s1">: np.zeros([self.minibatch_size])}</span>
+        inputs = {<span class="s4">'the_input'</span><span class="s1">: X_data</span><span class="s2">, </span>
+                  <span class="s4">'the_labels'</span><span class="s1">: labels</span><span class="s2">, </span>
+                  <span class="s4">'input_length'</span><span class="s1">: input_length</span><span class="s2">, </span>
+                  <span class="s4">'label_length'</span><span class="s1">: label_length </span>
+                 }
+        <span class="s2">return </span><span class="s1">(inputs</span><span class="s2">, </span><span class="s1">outputs)</span>
+
+    <span class="s2">def </span><span class="s1">shuffle_data_by_partition(self</span><span class="s2">, </span><span class="s1">partition):</span>
+        <span class="s0">&quot;&quot;&quot; Shuffle the training or validation data 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">partition == </span><span class="s4">'train'</span><span class="s1">:</span>
+            self.train_audio_paths<span class="s2">, </span><span class="s1">self.train_durations</span><span class="s2">, </span><span class="s1">self.train_texts = shuffle_data(</span>
+                self.train_audio_paths<span class="s2">, </span><span class="s1">self.train_durations</span><span class="s2">, </span><span class="s1">self.train_texts)</span>
+        <span class="s2">elif </span><span class="s1">partition == </span><span class="s4">'valid'</span><span class="s1">:</span>
+            self.valid_audio_paths<span class="s2">, </span><span class="s1">self.valid_durations</span><span class="s2">, </span><span class="s1">self.valid_texts = shuffle_data(</span>
+                self.valid_audio_paths<span class="s2">, </span><span class="s1">self.valid_durations</span><span class="s2">, </span><span class="s1">self.valid_texts)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">Exception(</span><span class="s4">&quot;Invalid partition. &quot;</span>
+                &quot;Must be train/validation&quot;<span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">sort_data_by_duration(self</span><span class="s2">, </span><span class="s1">partition):</span>
+        <span class="s0">&quot;&quot;&quot; Sort the training or validation sets by (increasing) duration 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">partition == </span><span class="s4">'train'</span><span class="s1">:</span>
+            self.train_audio_paths<span class="s2">, </span><span class="s1">self.train_durations</span><span class="s2">, </span><span class="s1">self.train_texts = sort_data(</span>
+                self.train_audio_paths<span class="s2">, </span><span class="s1">self.train_durations</span><span class="s2">, </span><span class="s1">self.train_texts)</span>
+        <span class="s2">elif </span><span class="s1">partition == </span><span class="s4">'valid'</span><span class="s1">:</span>
+            self.valid_audio_paths<span class="s2">, </span><span class="s1">self.valid_durations</span><span class="s2">, </span><span class="s1">self.valid_texts = sort_data(</span>
+                self.valid_audio_paths<span class="s2">, </span><span class="s1">self.valid_durations</span><span class="s2">, </span><span class="s1">self.valid_texts)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">Exception(</span><span class="s4">&quot;Invalid partition. &quot;</span>
+                &quot;Must be train/validation&quot;<span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">next_train(self):</span>
+        <span class="s0">&quot;&quot;&quot; Obtain a batch of training data 
+        &quot;&quot;&quot;</span>
+        <span class="s2">while True</span><span class="s1">:</span>
+            ret = self.get_batch(<span class="s4">'train'</span><span class="s1">)</span>
+            self.cur_train_index += self.minibatch_size
+            <span class="s2">if </span><span class="s1">self.cur_train_index &gt;= len(self.train_texts) - self.minibatch_size:</span>
+                self.cur_train_index = <span class="s3">0</span>
+                <span class="s1">self.shuffle_data_by_partition(</span><span class="s4">'train'</span><span class="s1">)</span>
+            <span class="s2">yield </span><span class="s1">ret    </span>
+
+    <span class="s2">def </span><span class="s1">next_valid(self):</span>
+        <span class="s0">&quot;&quot;&quot; Obtain a batch of validation data 
+        &quot;&quot;&quot;</span>
+        <span class="s2">while True</span><span class="s1">:</span>
+            ret = self.get_batch(<span class="s4">'valid'</span><span class="s1">)</span>
+            self.cur_valid_index += self.minibatch_size
+            <span class="s2">if </span><span class="s1">self.cur_valid_index &gt;= len(self.valid_texts) - self.minibatch_size:</span>
+                self.cur_valid_index = <span class="s3">0</span>
+                <span class="s1">self.shuffle_data_by_partition(</span><span class="s4">'valid'</span><span class="s1">)</span>
+            <span class="s2">yield </span><span class="s1">ret</span>
+
+    <span class="s2">def </span><span class="s1">next_test(self):</span>
+        <span class="s0">&quot;&quot;&quot; Obtain a batch of test data 
+        &quot;&quot;&quot;</span>
+        <span class="s2">while True</span><span class="s1">:</span>
+            ret = self.get_batch(<span class="s4">'test'</span><span class="s1">)</span>
+            self.cur_test_index += self.minibatch_size
+            <span class="s2">if </span><span class="s1">self.cur_test_index &gt;= len(self.test_texts) - self.minibatch_size:</span>
+                self.cur_test_index = <span class="s3">0</span>
+            <span class="s2">yield </span><span class="s1">ret</span>
+
+    <span class="s2">def </span><span class="s1">load_train_data(self</span><span class="s2">, </span><span class="s1">desc_file=</span><span class="s4">'train_corpus.json'</span><span class="s1">):</span>
+        self.load_metadata_from_desc_file(desc_file<span class="s2">, </span><span class="s4">'train'</span><span class="s1">)</span>
+        self.fit_train()
+        <span class="s2">if </span><span class="s1">self.sort_by_duration:</span>
+            self.sort_data_by_duration(<span class="s4">'train'</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">load_validation_data(self</span><span class="s2">, </span><span class="s1">desc_file=</span><span class="s4">'valid_corpus.json'</span><span class="s1">):</span>
+        self.load_metadata_from_desc_file(desc_file<span class="s2">, </span><span class="s4">'validation'</span><span class="s1">)</span>
+        <span class="s2">if </span><span class="s1">self.sort_by_duration:</span>
+            self.sort_data_by_duration(<span class="s4">'valid'</span><span class="s1">)</span>
+
+    <span class="s2">def </span><span class="s1">load_test_data(self</span><span class="s2">, </span><span class="s1">desc_file=</span><span class="s4">'test_corpus.json'</span><span class="s1">):</span>
+        self.load_metadata_from_desc_file(desc_file<span class="s2">, </span><span class="s4">'test'</span><span class="s1">)</span>
+    
+    <span class="s2">def </span><span class="s1">load_metadata_from_desc_file(self</span><span class="s2">, </span><span class="s1">desc_file</span><span class="s2">, </span><span class="s1">partition):</span>
+        <span class="s0">&quot;&quot;&quot; Read metadata from a JSON-line file 
+            (possibly takes long, depending on the filesize) 
+        Params: 
+            desc_file (str):  Path to a JSON-line file that contains labels and 
+                paths to the audio files 
+            partition (str): One of 'train', 'validation' or 'test' 
+        &quot;&quot;&quot;</span>
+        <span class="s1">audio_paths</span><span class="s2">, </span><span class="s1">durations</span><span class="s2">, </span><span class="s1">texts = []</span><span class="s2">, </span><span class="s1">[]</span><span class="s2">, </span><span class="s1">[]</span>
+        <span class="s2">with </span><span class="s1">open(desc_file) </span><span class="s2">as </span><span class="s1">json_line_file:</span>
+            <span class="s2">for </span><span class="s1">line_num</span><span class="s2">, </span><span class="s1">json_line </span><span class="s2">in </span><span class="s1">enumerate(json_line_file):</span>
+                <span class="s2">try</span><span class="s1">:</span>
+                    spec = json.loads(json_line)
+                    <span class="s2">if </span><span class="s1">float(spec[</span><span class="s4">'duration'</span><span class="s1">]) &gt; self.max_duration:</span>
+                        <span class="s2">continue</span>
+                    <span class="s1">audio_paths.append(spec[</span><span class="s4">'key'</span><span class="s1">])</span>
+                    durations.append(float(spec[<span class="s4">'duration'</span><span class="s1">]))</span>
+                    texts.append(spec[<span class="s4">'text'</span><span class="s1">])</span>
+                <span class="s2">except </span><span class="s1">Exception </span><span class="s2">as </span><span class="s1">e:</span>
+                    <span class="s5"># Change to (KeyError, ValueError) or</span>
+                    # (KeyError,json.decoder.JSONDecodeError), depending on
+                    # json module version
+                    <span class="s1">print(</span><span class="s4">'Error reading line #{}: {}'</span>
+                                <span class="s1">.format(line_num</span><span class="s2">, </span><span class="s1">json_line))</span>
+        <span class="s2">if </span><span class="s1">partition == </span><span class="s4">'train'</span><span class="s1">:</span>
+            self.train_audio_paths = audio_paths
+            self.train_durations = durations
+            self.train_texts = texts
+        <span class="s2">elif </span><span class="s1">partition == </span><span class="s4">'validation'</span><span class="s1">:</span>
+            self.valid_audio_paths = audio_paths
+            self.valid_durations = durations
+            self.valid_texts = texts
+        <span class="s2">elif </span><span class="s1">partition == </span><span class="s4">'test'</span><span class="s1">:</span>
+            self.test_audio_paths = audio_paths
+            self.test_durations = durations
+            self.test_texts = texts
+        <span class="s2">else</span><span class="s1">:</span>
+            <span class="s2">raise </span><span class="s1">Exception(</span><span class="s4">&quot;Invalid partition to load metadata. &quot;</span>
+             &quot;Must be train/validation/test&quot;<span class="s1">)</span>
+            
+    <span class="s2">def </span><span class="s1">fit_train(self</span><span class="s2">, </span><span class="s1">k_samples=</span><span class="s3">100</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; Estimate the mean and std of the features from the training set 
+        Params: 
+            k_samples (int): Use this number of samples for estimation 
+        &quot;&quot;&quot;</span>
+        <span class="s1">k_samples = min(k_samples</span><span class="s2">, </span><span class="s1">len(self.train_audio_paths))</span>
+        samples = self.rng.sample(self.train_audio_paths<span class="s2">, </span><span class="s1">k_samples)</span>
+        feats = [self.featurize(s) <span class="s2">for </span><span class="s1">s </span><span class="s2">in </span><span class="s1">samples]</span>
+        feats = np.vstack(feats)
+        self.feats_mean = np.mean(feats<span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+        self.feats_std = np.std(feats<span class="s2">, </span><span class="s1">axis=</span><span class="s3">0</span><span class="s1">)</span>
+        
+    <span class="s2">def </span><span class="s1">featurize(self</span><span class="s2">, </span><span class="s1">audio_clip):</span>
+        <span class="s0">&quot;&quot;&quot; For a given audio clip, calculate the corresponding feature 
+        Params: 
+            audio_clip (str): Path to the audio clip 
+        &quot;&quot;&quot;</span>
+        <span class="s2">if </span><span class="s1">self.spectrogram:</span>
+            <span class="s2">return </span><span class="s1">spectrogram_from_file(</span>
+                audio_clip<span class="s2">, </span><span class="s1">step=self.step</span><span class="s2">, </span><span class="s1">window=self.window</span><span class="s2">,</span>
+                <span class="s1">max_freq=self.max_freq)</span>
+        <span class="s2">else</span><span class="s1">:</span>
+            (rate<span class="s2">, </span><span class="s1">sig) = wav.read(audio_clip)</span>
+            <span class="s2">return </span><span class="s1">mfcc(sig</span><span class="s2">, </span><span class="s1">rate</span><span class="s2">, </span><span class="s1">numcep=self.mfcc_dim)</span>
+
+    <span class="s2">def </span><span class="s1">normalize(self</span><span class="s2">, </span><span class="s1">feature</span><span class="s2">, </span><span class="s1">eps=</span><span class="s3">1e-14</span><span class="s1">):</span>
+        <span class="s0">&quot;&quot;&quot; Center a feature using the mean and std 
+        Params: 
+            feature (numpy.ndarray): Feature to normalize 
+        &quot;&quot;&quot;</span>
+        <span class="s2">return </span><span class="s1">(feature - self.feats_mean) / (self.feats_std + eps)</span>
+
+<span class="s2">def </span><span class="s1">shuffle_data(audio_paths</span><span class="s2">, </span><span class="s1">durations</span><span class="s2">, </span><span class="s1">texts):</span>
+    <span class="s0">&quot;&quot;&quot; Shuffle the data (called after making a complete pass through  
+        training or validation data during the training process) 
+    Params: 
+        audio_paths (list): Paths to audio clips 
+        durations (list): Durations of utterances for each audio clip 
+        texts (list): Sentences uttered in each audio clip 
+    &quot;&quot;&quot;</span>
+    <span class="s1">p = np.random.permutation(len(audio_paths))</span>
+    audio_paths = [audio_paths[i] <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">p] </span>
+    durations = [durations[i] <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">p] </span>
+    texts = [texts[i] <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">p]</span>
+    <span class="s2">return </span><span class="s1">audio_paths</span><span class="s2">, </span><span class="s1">durations</span><span class="s2">, </span><span class="s1">texts</span>
+
+<span class="s2">def </span><span class="s1">sort_data(audio_paths</span><span class="s2">, </span><span class="s1">durations</span><span class="s2">, </span><span class="s1">texts):</span>
+    <span class="s0">&quot;&quot;&quot; Sort the data by duration  
+    Params: 
+        audio_paths (list): Paths to audio clips 
+        durations (list): Durations of utterances for each audio clip 
+        texts (list): Sentences uttered in each audio clip 
+    &quot;&quot;&quot;</span>
+    <span class="s1">p = np.argsort(durations).tolist()</span>
+    audio_paths = [audio_paths[i] <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">p]</span>
+    durations = [durations[i] <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">p] </span>
+    texts = [texts[i] <span class="s2">for </span><span class="s1">i </span><span class="s2">in </span><span class="s1">p]</span>
+    <span class="s2">return </span><span class="s1">audio_paths</span><span class="s2">, </span><span class="s1">durations</span><span class="s2">, </span><span class="s1">texts</span>
+
+<span class="s2">def </span><span class="s1">vis_train_features(index=</span><span class="s3">0</span><span class="s1">):</span>
+    <span class="s0">&quot;&quot;&quot; Visualizing the data point in the training set at the supplied index 
+    &quot;&quot;&quot;</span>
+    <span class="s5"># obtain spectrogram</span>
+    <span class="s1">audio_gen = AudioGenerator(spectrogram=</span><span class="s2">True</span><span class="s1">)</span>
+    audio_gen.load_train_data()
+    vis_audio_path = audio_gen.train_audio_paths[index]
+    vis_spectrogram_feature = audio_gen.normalize(audio_gen.featurize(vis_audio_path))
+    <span class="s5"># obtain mfcc</span>
+    <span class="s1">audio_gen = AudioGenerator(spectrogram=</span><span class="s2">False</span><span class="s1">)</span>
+    audio_gen.load_train_data()
+    vis_mfcc_feature = audio_gen.normalize(audio_gen.featurize(vis_audio_path))
+    <span class="s5"># obtain text label</span>
+    <span class="s1">vis_text = audio_gen.train_texts[index]</span>
+    <span class="s5"># obtain raw audio</span>
+    <span class="s1">vis_raw_audio</span><span class="s2">, </span><span class="s1">_ = librosa.load(vis_audio_path)</span>
+    <span class="s5"># print total number of training examples</span>
+    <span class="s1">print(</span><span class="s4">'There are %d total training examples.' </span><span class="s1">% len(audio_gen.train_audio_paths))</span>
+    <span class="s5"># return labels for plotting</span>
+    <span class="s2">return </span><span class="s1">vis_text</span><span class="s2">, </span><span class="s1">vis_raw_audio</span><span class="s2">, </span><span class="s1">vis_mfcc_feature</span><span class="s2">, </span><span class="s1">vis_spectrogram_feature</span><span class="s2">, </span><span class="s1">vis_audio_path</span>
+
+
+<span class="s2">def </span><span class="s1">plot_raw_audio(vis_raw_audio):</span>
+    <span class="s5"># plot the raw audio signal</span>
+    <span class="s1">fig = plt.figure(figsize=(</span><span class="s3">12</span><span class="s2">,</span><span class="s3">3</span><span class="s1">))</span>
+    ax = fig.add_subplot(<span class="s3">111</span><span class="s1">)</span>
+    steps = len(vis_raw_audio)
+    ax.plot(np.linspace(<span class="s3">1</span><span class="s2">, </span><span class="s1">steps</span><span class="s2">, </span><span class="s1">steps)</span><span class="s2">, </span><span class="s1">vis_raw_audio)</span>
+    plt.title(<span class="s4">'Audio Signal'</span><span class="s1">)</span>
+    plt.xlabel(<span class="s4">'Time'</span><span class="s1">)</span>
+    plt.ylabel(<span class="s4">'Amplitude'</span><span class="s1">)</span>
+    plt.show()
+
+<span class="s2">def </span><span class="s1">plot_mfcc_feature(vis_mfcc_feature):</span>
+    <span class="s5"># plot the MFCC feature</span>
+    <span class="s1">fig = plt.figure(figsize=(</span><span class="s3">12</span><span class="s2">,</span><span class="s3">5</span><span class="s1">))</span>
+    ax = fig.add_subplot(<span class="s3">111</span><span class="s1">)</span>
+    im = ax.imshow(vis_mfcc_feature<span class="s2">, </span><span class="s1">cmap=plt.cm.jet</span><span class="s2">, </span><span class="s1">aspect=</span><span class="s4">'auto'</span><span class="s1">)</span>
+    plt.title(<span class="s4">'Normalized MFCC'</span><span class="s1">)</span>
+    plt.ylabel(<span class="s4">'Time'</span><span class="s1">)</span>
+    plt.xlabel(<span class="s4">'MFCC Coefficient'</span><span class="s1">)</span>
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes(<span class="s4">&quot;right&quot;</span><span class="s2">, </span><span class="s1">size=</span><span class="s4">&quot;5%&quot;</span><span class="s2">, </span><span class="s1">pad=</span><span class="s3">0.05</span><span class="s1">)</span>
+    plt.colorbar(im<span class="s2">, </span><span class="s1">cax=cax)</span>
+    ax.set_xticks(np.arange(<span class="s3">0</span><span class="s2">, </span><span class="s3">13</span><span class="s2">, </span><span class="s3">2</span><span class="s1">)</span><span class="s2">, </span><span class="s1">minor=</span><span class="s2">False</span><span class="s1">);</span>
+    plt.show()
+
+<span class="s2">def </span><span class="s1">plot_spectrogram_feature(vis_spectrogram_feature):</span>
+    <span class="s5"># plot the normalized spectrogram</span>
+    <span class="s1">fig = plt.figure(figsize=(</span><span class="s3">12</span><span class="s2">,</span><span class="s3">5</span><span class="s1">))</span>
+    ax = fig.add_subplot(<span class="s3">111</span><span class="s1">)</span>
+    im = ax.imshow(vis_spectrogram_feature<span class="s2">, </span><span class="s1">cmap=plt.cm.jet</span><span class="s2">, </span><span class="s1">aspect=</span><span class="s4">'auto'</span><span class="s1">)</span>
+    plt.title(<span class="s4">'Normalized Spectrogram'</span><span class="s1">)</span>
+    plt.ylabel(<span class="s4">'Time'</span><span class="s1">)</span>
+    plt.xlabel(<span class="s4">'Frequency'</span><span class="s1">)</span>
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes(<span class="s4">&quot;right&quot;</span><span class="s2">, </span><span class="s1">size=</span><span class="s4">&quot;5%&quot;</span><span class="s2">, </span><span class="s1">pad=</span><span class="s3">0.05</span><span class="s1">)</span>
+    plt.colorbar(im<span class="s2">, </span><span class="s1">cax=cax)</span>
+    plt.show()
+
+</pre>
+</body>
+</html>
